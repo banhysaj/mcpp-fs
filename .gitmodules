@@ -1,0 +1,4 @@
+[submodule "mcpp-fs/mcpp_async"]
+	path = mcpp-fs/mcpp_async
+	url = https://github.com/banhysaj/mcpp_async.git
+	branch = main

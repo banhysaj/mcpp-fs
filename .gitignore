@@ -1,0 +1,19 @@
+# Visual Studio
+.vs/
+*.vcxproj.user
+
+# Build output
+[Xx]64/
+[Ww]in32/
+[Dd]ebug/
+[Rr]elease/
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.idb
+*.iobj
+*.ipdb
+*.log
+*.tlog
+*.lastbuildstate
