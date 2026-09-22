@@ -147,7 +147,7 @@ Session
 `load_dir` is the tool to use when you're about to work in a folder a lot. It
 reads the files under it into memory in the background and returns right away, so
 you're never left waiting on it. From then on, reads and searches over those files
-come from memory instead of the disk. It stays honest too. If a file changes on
+come from memory instead of the disk. It stays honest too, if a file changes on
 disk the cache notices and refreshes, so you never get served stale content.
 
 It takes a handful of optional arguments:
