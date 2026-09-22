@@ -6,8 +6,11 @@
 #include <cstdio>
 #include <fstream>
 #include <map>
+#include <unordered_map>
+#include <cstdint>
 #include <memory>
 #include <mutex>
+#include <atomic>
 #include <regex>
 #include <set>
 #include <sstream>
@@ -49,6 +52,10 @@ namespace {
 
     std::mutex g_wdMx;
     fs::path g_workdir = fs::current_path();
+
+    // lock the entire session to the root, if we are given a root parameter
+    fs::path g_rootLock;
+    bool g_rootLocked = false;
 
     fs::path workdir() {
         std::lock_guard<std::mutex> lk(g_wdMx);
@@ -100,6 +107,23 @@ namespace {
         if (p.empty()) return workdir();
         fs::path fp = fromU8(p);
         return fp.is_absolute() ? fp : (workdir() / fp);
+    }
+
+    // Did the client escape our root prison?
+    bool withinRoot(const fs::path& p) {
+        if (!g_rootLocked) return true;
+        std::error_code ec;
+        fs::path a = fs::weakly_canonical(p, ec);
+        if (a.empty()) a = p.lexically_normal();
+        fs::path rel = a.lexically_relative(g_rootLock);
+        if (rel.empty()) return false;
+        std::string s = toU8gen(rel);
+        if (s == ".." || s.rfind("../", 0) == 0) return false; // escapes upward
+        return true; // "." (equal) or below
+    }
+
+    std::string outsideRootMsg(const fs::path& p) {
+        return "'" + toU8(p) + "' is outside the locked --root (" + toU8(g_rootLock) + ")";
     }
 
     // Directories we never bother descending into
@@ -160,7 +184,43 @@ namespace {
         return out;
     }
 
+
+    // load_dir pulls a directory's files into RAM so repeated search/read/outline
+    // over that tree don't keep hitting the disk.
+    struct CacheEntry {
+        std::string content;
+        fs::file_time_type mtime;
+        std::uintmax_t size = 0;
+    };
+    std::mutex g_cacheMx;
+    std::unordered_map<std::string, CacheEntry> g_cache;
+    std::set<std::string> g_loadedDirs;
+
+    // A stable, disk-free key for a path: normalized, forward-slashed, and (on Windows) lowercased
+    std::string cacheKey(const fs::path& p) {
+        std::string k = toU8gen(p.lexically_normal());
+#if defined(_WIN32)
+        k = lower(k);
+#endif
+        return k;
+    }
+
     bool readFile(const fs::path& path, std::string& out) {
+        const std::string key = cacheKey(path);
+        {
+            std::lock_guard<std::mutex> lk(g_cacheMx);
+            auto it = g_cache.find(key);
+            if (it != g_cache.end()) {
+                std::error_code ec;
+                auto mt = fs::last_write_time(path, ec);
+                auto sz = fs::file_size(path, ec);
+                if (!ec && mt == it->second.mtime && sz == it->second.size) {
+                    out = it->second.content; // served from memory, body not read
+                    return true;
+                }
+                g_cache.erase(it); // changed or gone -> fall through to disk
+            }
+        }
         std::ifstream f(path, std::ios::binary);
         if (!f) return false;
         std::ostringstream ss;
@@ -173,6 +233,17 @@ namespace {
         std::ofstream f(path, std::ios::binary);
         if (!f) return false;
         f << data;
+        f.close();
+
+        const std::string key = cacheKey(path);
+        std::lock_guard<std::mutex> lk(g_cacheMx);
+        auto it = g_cache.find(key);
+        if (it != g_cache.end()) {
+            std::error_code ec;
+            it->second.content = data;
+            it->second.mtime = fs::last_write_time(path, ec);
+            it->second.size = data.size();
+        }
         return true;
     }
 
@@ -258,7 +329,12 @@ namespace {
         if (count > 5000) count = 5000;
 
         std::string content;
-        if (!readFile(resolvePath(displayPath), content)) {
+        fs::path fp = resolvePath(displayPath);
+        if (!withinRoot(fp)) {
+            out << "== " << displayPath << " (outside --root) ==\n";
+            return;
+        }
+        if (!readFile(fp, content)) {
             out << "== " << displayPath << " (cannot open) ==\n";
             return;
         }
@@ -365,6 +441,7 @@ namespace {
 
         std::error_code ec;
         fs::path base = resolvePath(root);
+        if (!withinRoot(base)) return ToolResult::error("search: " + outsideRootMsg(base));
         if (!fs::exists(base, ec)) return ToolResult::error("search: path not found: " + toU8(base));
 
         std::ostringstream out;
@@ -518,7 +595,9 @@ namespace {
         if (count > 5000) count = 5000;
 
         std::string content;
-        if (!readFile(resolvePath(path), content)) return ToolResult::error("read_lines: cannot open: " + path);
+        fs::path fp = resolvePath(path);
+        if (!withinRoot(fp)) return ToolResult::error("read_lines: " + outsideRootMsg(fp));
+        if (!readFile(fp, content)) return ToolResult::error("read_lines: cannot open: " + path);
         std::vector<std::string> lines = splitLines(content);
 
         std::ostringstream out;
@@ -606,7 +685,12 @@ namespace {
         std::ostringstream out;
         for (const std::string& path : paths) {
             std::string content;
-            if (!readFile(resolvePath(path), content)) {
+            fs::path fp = resolvePath(path);
+            if (!withinRoot(fp)) {
+                out << path << " (outside --root)\n";
+                continue;
+            }
+            if (!readFile(fp, content)) {
                 out << path << " (cannot open)\n";
                 continue;
             }
@@ -652,6 +736,7 @@ namespace {
 
         std::error_code ec;
         fs::path base = resolvePath(root);
+        if (!withinRoot(base)) return ToolResult::error("find_files: " + outsideRootMsg(base));
         if (!fs::exists(base, ec)) return ToolResult::error("find_files: path not found: " + toU8(base));
 
         std::ostringstream out;
@@ -697,6 +782,7 @@ namespace {
 
         std::error_code ec;
         fs::path base = resolvePath(p);
+        if (!withinRoot(base)) return ToolResult::error("list_dir: " + outsideRootMsg(base));
         if (!fs::exists(base, ec)) return ToolResult::error("list_dir: path not found: " + toU8(base));
         if (!fs::is_directory(base, ec)) return ToolResult::error("list_dir: not a directory: " + toU8(base));
 
@@ -729,6 +815,7 @@ namespace {
         std::string path = args::str(a, "path");
         if (path.empty()) return ToolResult::error("create_dir: 'path' is required");
         fs::path fp = resolvePath(path);
+        if (!withinRoot(fp)) return ToolResult::error("create_dir: " + outsideRootMsg(fp));
 
         std::error_code ec;
         if (fs::exists(fp, ec)) {
@@ -748,6 +835,7 @@ namespace {
         std::string content = args::str(a, "content");
         bool overwrite = args::boolean(a, "overwrite", false);
         fs::path fp = resolvePath(path);
+        if (!withinRoot(fp)) return ToolResult::error("create_file: " + outsideRootMsg(fp));
 
         std::error_code ec;
         if (fs::exists(fp, ec) && !overwrite) {
@@ -785,6 +873,7 @@ namespace {
         bool all = args::boolean(a, "all", false);
 
         fs::path fp = resolvePath(path);
+        if (!withinRoot(fp)) return ToolResult::error("apply_edit: " + outsideRootMsg(fp));
         std::string content;
         if (!readFile(fp, content)) return ToolResult::error("apply_edit: cannot open: " + path);
 
@@ -844,6 +933,178 @@ namespace {
         std::ostringstream head;
         head << "edited " << path << " (" << count << " replacement" << (count == 1 ? "" : "s") << ")";
         return ToolResult::text(capOutput(head.str()));
+    }
+
+
+    // load_dir reads a directory tree into g_cache on a BACKGROUND thread so the
+    // client can fire it and move on. It returns a load-job id right away so progress
+    // and completion show up in cache_status. Reads are served from RAM the moment
+    // each file lands. A memory budget bounds how much it pulls in
+    struct LoadJob {
+        long long id = 0;
+        std::string dir;
+        std::atomic<size_t> loaded{ 0 };
+        std::atomic<std::uintmax_t> bytes{ 0 };
+        std::atomic<size_t> skippedBig{ 0 };
+        std::atomic<size_t> skippedBin{ 0 };
+        std::atomic<size_t> failed{ 0 };
+        std::atomic<bool> done{ false };
+        std::atomic<bool> capped{ false }; // stopped early on the memory budget
+    };
+
+    std::mutex g_loadJobsMx;
+    std::map<long long, std::shared_ptr<LoadJob>> g_loadJobs;
+    std::atomic<long long> g_loadJobSeq{ 1 };
+
+    // The actual walk. Runs on a detached worker thread
+    void runLoadJob(std::shared_ptr<LoadJob> job, fs::path base,
+        std::set<std::string> exts, std::uintmax_t maxFileBytes,
+        std::uintmax_t memBudget) {
+        std::error_code ec;
+        std::uintmax_t loadedBytes = 0;
+        fs::recursive_directory_iterator it(base, fs::directory_options::skip_permission_denied, ec), end;
+        for (; it != end; it.increment(ec)) {
+            if (ec) { ec.clear(); continue; }
+            const fs::path& p = it->path();
+            if (it->is_directory(ec)) {
+                if (skipDirs().count(toU8(p.filename()))) it.disable_recursion_pending();
+                continue;
+            }
+            if (!it->is_regular_file(ec)) continue;
+            std::string ext = lower(toU8(p.extension()));
+            if (isBinaryExt(ext)) { job->skippedBin++; continue; }
+            if (!exts.empty() && !exts.count(ext)) continue;
+            std::uintmax_t sz = it->file_size(ec);
+            if (ec) { ec.clear(); job->failed++; continue; }
+            if (sz > maxFileBytes) { job->skippedBig++; continue; }
+
+            std::string content;
+            {
+                std::ifstream f(p, std::ios::binary);
+                if (!f) { job->failed++; continue; }
+                std::ostringstream ss; ss << f.rdbuf(); content = ss.str();
+            }
+            CacheEntry e;
+            e.size = content.size();
+            e.mtime = fs::last_write_time(p, ec);
+            e.content = std::move(content);
+            {
+                std::lock_guard<std::mutex> lk(g_cacheMx);
+                g_cache[cacheKey(p)] = std::move(e);
+            }
+            loadedBytes += sz;
+            job->loaded++;
+            job->bytes.store(loadedBytes);
+
+            if (loadedBytes >= memBudget) { job->capped = true; break; }
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_cacheMx);
+            g_loadedDirs.insert(cacheKey(base));
+        }
+        job->done = true;
+    }
+
+    // load_dir: kick off a background load
+    // args: path=".", memBudgetMB=256, maxFileSizeKB=2048, exts="", setRoot=false
+    ToolResult toolLoadDir(const rj::Value& a) {
+        std::string path = args::str(a, "path");
+        fs::path base = resolvePath(path);
+        std::error_code ec;
+        if (!withinRoot(base)) return ToolResult::error("load_dir: " + outsideRootMsg(base));
+        if (!fs::exists(base, ec)) return ToolResult::error("load_dir: path not found: " + toU8(base));
+        if (!fs::is_directory(base, ec)) return ToolResult::error("load_dir: not a directory: " + toU8(base));
+
+        long long budgetMB = args::integer(a, "memBudgetMB", 256);
+        if (budgetMB < 1) budgetMB = 256;
+        long long maxKB = args::integer(a, "maxFileSizeKB", 2048);
+        if (maxKB < 1) maxKB = 2048;
+        std::set<std::string> exts = parseExts(args::str(a, "exts"));
+        bool setRoot = args::boolean(a, "setRoot", false);
+
+        std::string rootNote;
+        if (setRoot) {
+            fs::path canon = fs::weakly_canonical(base, ec);
+            fs::path target = canon.empty() ? base : canon;
+            if (!withinRoot(target)) {
+                return ToolResult::error("load_dir: setRoot target '" + toU8(target) + "' is outside the locked --root (" + toU8(g_rootLock) + ")");
+            }
+            setWorkdir(target);
+            rootNote = "\nworkdir set to " + toU8(workdir());
+        }
+
+        auto job = std::make_shared<LoadJob>();
+        job->id = g_loadJobSeq++;
+        job->dir = toU8(base);
+        {
+            std::lock_guard<std::mutex> lk(g_loadJobsMx);
+            g_loadJobs[job->id] = job;
+        }
+
+        std::thread(runLoadJob, job, base, exts,
+            (std::uintmax_t)maxKB * 1024,
+            (std::uintmax_t)budgetMB * 1024 * 1024).detach();
+
+        std::ostringstream out;
+        out << "load started for " << toU8(base) << " (load job " << job->id << ")\n"
+            << "Files are streaming into memory in the background, up to a " << budgetMB
+            << " MB budget. Reads hit RAM the moment each file lands.\n"
+            << "Check progress with cache_status." << rootNote;
+        return ToolResult::text(capOutput(out.str()));
+    }
+
+    // cache_clear: free cached files. No path -> clear everything; a path -> clear
+    // just the entries under that directory
+    ToolResult toolCacheClear(const rj::Value& a) {
+        std::string path = args::str(a, "path");
+        std::lock_guard<std::mutex> lk(g_cacheMx);
+        if (path.empty()) {
+            size_t n = g_cache.size();
+            g_cache.clear();
+            g_loadedDirs.clear();
+            return ToolResult::text("cleared cache: freed " + std::to_string(n) + " file(s)");
+        }
+        std::string prefix = cacheKey(resolvePath(path));
+        size_t removed = 0;
+        for (auto it = g_cache.begin(); it != g_cache.end();) {
+            if (it->first == prefix || it->first.rfind(prefix + "/", 0) == 0) {
+                it = g_cache.erase(it);
+                ++removed;
+            }
+            else {
+                ++it;
+            }
+        }
+        g_loadedDirs.erase(prefix);
+        return ToolResult::text("cleared " + std::to_string(removed) + " cached file(s) under " + path);
+    }
+
+    // cache_status: totals held in memory plus any load jobs and their progress
+    ToolResult toolCacheStatus(const rj::Value&) {
+        std::ostringstream out;
+        {
+            std::lock_guard<std::mutex> lk(g_cacheMx);
+            std::uintmax_t bytes = 0;
+            for (const auto& kv : g_cache) bytes += kv.second.content.size();
+            out << g_cache.size() << " file(s) in memory, " << (bytes / 1024) << " KB\n";
+        }
+        std::lock_guard<std::mutex> lk(g_loadJobsMx);
+        if (g_loadJobs.empty()) {
+            out << "no load jobs";
+            return ToolResult::text(capOutput(out.str()));
+        }
+        out << "load jobs:\n";
+        for (const auto& kv : g_loadJobs) {
+            const LoadJob& j = *kv.second;
+            out << "  job " << j.id << ": "
+                << (j.done ? (j.capped ? "DONE (hit budget)" : "DONE") : "RUNNING")
+                << ", " << j.loaded.load() << " file(s), " << (j.bytes.load() / 1024) << " KB";
+            if (j.skippedBig) out << ", " << j.skippedBig.load() << " too big";
+            if (j.skippedBin) out << ", " << j.skippedBin.load() << " binary";
+            if (j.failed)     out << ", " << j.failed.load() << " failed";
+            out << "  <- " << j.dir << "\n";
+        }
+        return ToolResult::text(capOutput(out.str()));
     }
 
 
@@ -1006,9 +1267,41 @@ namespace {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     Server s("fs-mcp-server", "1.0.0");
     loadPersistedWorkdir(); // if workdir exists, pick it up
+    bool allowExec = true;
+
+
+    // Set the root path for the server
+    {
+        std::string rootArg;
+        for (int i = 1; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--no-exec") {
+                allowExec = false;
+            }
+            if (a == "--root" && i + 1 < argc) {
+                rootArg = argv[++i];
+            }
+        }
+        if (!rootArg.empty()) {
+            std::error_code ec;
+            fs::path want = fromU8(rootArg);
+            if (fs::is_directory(want, ec)) {
+                fs::path canon = fs::weakly_canonical(want, ec);
+                fs::path rootp = canon.empty() ? want : canon;
+                g_rootLock = rootp; // this tree is now the boundary for the session
+                g_rootLocked = true;
+                setWorkdir(rootp);
+                // diagnostics go to stderr, nothing from here should go to stdout, it is reserved for the JSON-RPC channel
+                std::fprintf(stderr, "[fs-mcp] root locked to %s\n", toU8(workdir()).c_str());
+            }
+            else {
+                std::fprintf(stderr, "[fs-mcp] --root '%s' is not a directory; ignoring\n", rootArg.c_str());
+            }
+        }
+    }
 
     // A persistent memory at the beginning of each session
     s.setInstructions(
@@ -1016,7 +1309,10 @@ int main() {
         "are working in). All relative path arguments to search / find_files / "
         "list_dir / read_lines / outline / apply_edit / create_file / create_dir, "
         "and every 'run' command, resolve against that workdir. "
-        "Discover layout with list_dir (one level) and find_files (recursive glob).");
+        "Discover layout with list_dir (one level) and find_files (recursive glob). "
+        "Working in one directory a lot? Call load_dir on it once (optionally "
+        "setRoot=true) to cache it in memory in the background, so repeated "
+        "search / read_lines / outline are faster.");
 
     // search -> pattern across files
     {
@@ -1101,139 +1397,143 @@ int main() {
         t.addParameter("overwrite", PropertyType::Boolean, "Replace if it already exists (default false)", false);
         s.addTool(t, toolCreateFile);
     }
-    // run -> execute a command
-    {
-        Tool t("run", "Run a shell command (e.g. git) in the session workdir. Foreground returns exit code + last lines + a log_id. For anything slow, pass background:true -- it opens a visible window you can watch, returns a job_id at once, and keeps running even if this call is cancelled or the server restarts. Wait for it with 'job_wait'.");
-        t.addParameter("command", PropertyType::String, "Command line to execute (runs in the workdir set by set_workdir)");
-        t.addParameter("tail", PropertyType::Integer, "How many trailing lines to return (default 20)", false);
-        t.addParameter("background", PropertyType::Boolean, "Launch detached (visible window + on-disk log) and return a job_id at once. Use for long/slow commands. Default false.", false);
-        s.addTool(t, [](const rj::Value& a) {
-            std::string cmd = args::str(a, "command");
-            if (cmd.empty()) return ToolResult::error("run: 'command' is required");
-            long long tailN = args::integer(a, "tail", 20);
-            if (tailN < 0) tailN = 20;
-            bool background = args::boolean(a, "background", false);
 
-            long long id = nextJobId();
+    // don't expose the tools at all if the user does not want command execution
+    if (allowExec) {
+        // run -> execute a command
+        {
+            Tool t("run", "Run a shell command (e.g. git) in the session workdir. Foreground returns exit code + last lines + a log_id. For anything slow, pass background:true -- it opens a visible window you can watch, returns a job_id at once, and keeps running even if this call is cancelled or the server restarts. Wait for it with 'job_wait'.");
+            t.addParameter("command", PropertyType::String, "Command line to execute (runs in the workdir set by set_workdir)");
+            t.addParameter("tail", PropertyType::Integer, "How many trailing lines to return (default 20)", false);
+            t.addParameter("background", PropertyType::Boolean, "Launch detached (visible window + on-disk log) and return a job_id at once. Use for long/slow commands. Default false.", false);
+            s.addTool(t, [](const rj::Value& a) {
+                std::string cmd = args::str(a, "command");
+                if (cmd.empty()) return ToolResult::error("run: 'command' is required");
+                long long tailN = args::integer(a, "tail", 20);
+                if (tailN < 0) tailN = 20;
+                bool background = args::boolean(a, "background", false);
 
-            if (background) {
-                std::string err;
-                if (!launchDetached(cmd, id, err)) return ToolResult::error("run: " + err);
+                long long id = nextJobId();
+
+                if (background) {
+                    std::string err;
+                    if (!launchDetached(cmd, id, err)) return ToolResult::error("run: " + err);
+                    std::ostringstream out;
+                    out << "started background job " << id << " (job_id " << id << ", log_id " << id << ")\n"
+                        << "A window opened so you can watch it live.\n"
+                        << "Wait for it:  job_wait id=" << id << "   Status:  job id=" << id
+                        << "   Full log:  read_log log_id=" << id << "\n"
+                        << "Survives a server/Claude restart (state is on disk).";
+                    return ToolResult::text(capOutput(out.str()));
+                }
+
+                std::string output;
+                int code;
+                runForeground(cmd, id, output, code);
+                std::vector<std::string> lines = splitLines(output);
                 std::ostringstream out;
-                out << "started background job " << id << " (job_id " << id << ", log_id " << id << ")\n"
-                    << "A window opened so you can watch it live.\n"
-                    << "Wait for it:  job_wait id=" << id << "   Status:  job id=" << id
-                    << "   Full log:  read_log log_id=" << id << "\n"
-                    << "Survives a server/Claude restart (state is on disk).";
+                out << "exit " << code << ", " << lines.size() << " lines (log_id " << id << ")\n";
+                long long from = (long long)lines.size() - tailN;
+                if (from < 0) from = 0;
+                for (long long i = from; i < (long long)lines.size(); ++i) {
+                    out << lines[(size_t)i] << "\n";
+                }
                 return ToolResult::text(capOutput(out.str()));
-            }
+                });
+        }
+        // job -> non-blocking status snapshot of a background job
+        {
+            Tool t("job", "Check a background 'run' job: RUNNING or DONE + exit code, plus the last lines of its output. Non-blocking snapshot, to wait, use job_wait.");
+            t.addParameter("id", PropertyType::Integer, "job_id returned by run(background:true)");
+            t.addParameter("tail", PropertyType::Integer, "How many trailing lines to return (default 20)", false);
+            s.addTool(t, [](const rj::Value& a) {
+                long long id = args::integer(a, "id", 0);
+                long long tailN = args::integer(a, "tail", 20);
+                if (tailN < 0) tailN = 20;
+                JobView v = readJobFiles(id);
+                if (!v.exists) return ToolResult::error("job: unknown id " + std::to_string(id));
 
-            std::string output;
-            int code;
-            runForeground(cmd, id, output, code);
-            std::vector<std::string> lines = splitLines(output);
-            std::ostringstream out;
-            out << "exit " << code << ", " << lines.size() << " lines (log_id " << id << ")\n";
-            long long from = (long long)lines.size() - tailN;
-            if (from < 0) from = 0;
-            for (long long i = from; i < (long long)lines.size(); ++i) {
-                out << lines[(size_t)i] << "\n";
-            }
-            return ToolResult::text(capOutput(out.str()));
-            });
-    }
-    // job -> non-blocking status snapshot of a background job
-    {
-        Tool t("job", "Check a background 'run' job: RUNNING or DONE + exit code, plus the last lines of its output. Non-blocking snapshot, to wait, use job_wait.");
-        t.addParameter("id", PropertyType::Integer, "job_id returned by run(background:true)");
-        t.addParameter("tail", PropertyType::Integer, "How many trailing lines to return (default 20)", false);
-        s.addTool(t, [](const rj::Value& a) {
-            long long id = args::integer(a, "id", 0);
-            long long tailN = args::integer(a, "tail", 20);
-            if (tailN < 0) tailN = 20;
-            JobView v = readJobFiles(id);
-            if (!v.exists) return ToolResult::error("job: unknown id " + std::to_string(id));
+                std::vector<std::string> lines = splitLines(v.output);
+                std::ostringstream out;
+                if (v.done) out << "job " << id << ": DONE, exit " << v.exit;
+                else        out << "job " << id << ": RUNNING";
+                out << ", " << lines.size() << " lines so far (log_id " << id << ")\n";
+                long long from = (long long)lines.size() - tailN;
+                if (from < 0) from = 0;
+                for (long long i = from; i < (long long)lines.size(); ++i) {
+                    out << lines[(size_t)i] << "\n";
+                }
+                return ToolResult::text(capOutput(out.str()));
+                });
+        }
+        // job_wait -> long-poll a job's files until it finishes (or times out)
+        // The default timeout is between 45-50 seconds, that's how long usually client wait before restarting an stdio mcp server 
+        {
+            Tool t("job_wait", "Wait for a background 'run' job to finish, then return its exit code + tail. Polls the job's on-disk state and returns THE MOMENT it completes (or, if still running after 'timeout' seconds, a RUNNING status -- just call again). Use this instead of sleeping.");
+            t.addParameter("id", PropertyType::Integer, "job_id returned by run(background:true)");
+            t.addParameter("timeout", PropertyType::Integer, "Max seconds to block (default 45, max 50 -- kept under the client timeout so it never forces a server restart).", false);
+            t.addParameter("tail", PropertyType::Integer, "How many trailing lines to return (default 20)", false);
+            s.addTool(t, [](const rj::Value& a) {
+                long long id = args::integer(a, "id", 0);
+                long long timeoutS = args::integer(a, "timeout", 45);
+                long long tailN = args::integer(a, "tail", 20);
+                if (timeoutS < 1) timeoutS = 1;
+                if (timeoutS > 50) timeoutS = 50;
+                if (tailN < 0) tailN = 20;
 
-            std::vector<std::string> lines = splitLines(v.output);
-            std::ostringstream out;
-            if (v.done) out << "job " << id << ": DONE, exit " << v.exit;
-            else        out << "job " << id << ": RUNNING";
-            out << ", " << lines.size() << " lines so far (log_id " << id << ")\n";
-            long long from = (long long)lines.size() - tailN;
-            if (from < 0) from = 0;
-            for (long long i = from; i < (long long)lines.size(); ++i) {
-                out << lines[(size_t)i] << "\n";
-            }
-            return ToolResult::text(capOutput(out.str()));
-            });
-    }
-    // job_wait -> long-poll a job's files until it finishes (or times out)
-    // The default timeout is between 45-50 seconds, that's how long usually client wait before restarting an stdio mcp server 
-    {
-        Tool t("job_wait", "Wait for a background 'run' job to finish, then return its exit code + tail. Polls the job's on-disk state and returns THE MOMENT it completes (or, if still running after 'timeout' seconds, a RUNNING status -- just call again). Use this instead of sleeping.");
-        t.addParameter("id", PropertyType::Integer, "job_id returned by run(background:true)");
-        t.addParameter("timeout", PropertyType::Integer, "Max seconds to block (default 45, max 50 -- kept under the client timeout so it never forces a server restart).", false);
-        t.addParameter("tail", PropertyType::Integer, "How many trailing lines to return (default 20)", false);
-        s.addTool(t, [](const rj::Value& a) {
-            long long id = args::integer(a, "id", 0);
-            long long timeoutS = args::integer(a, "timeout", 45);
-            long long tailN = args::integer(a, "tail", 20);
-            if (timeoutS < 1) timeoutS = 1;
-            if (timeoutS > 50) timeoutS = 50;
-            if (tailN < 0) tailN = 20;
+                JobView v = readJobFiles(id);
+                if (!v.exists) {
+                    return ToolResult::error("job_wait: unknown id " + std::to_string(id));
+                }
+                auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeoutS);
+                while (!v.done && std::chrono::steady_clock::now() < deadline) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                    v = readJobFiles(id);
+                }
 
-            JobView v = readJobFiles(id);
-            if (!v.exists) {
-                return ToolResult::error("job_wait: unknown id " + std::to_string(id));
-            }
-            auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeoutS);
-            while (!v.done && std::chrono::steady_clock::now() < deadline) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                v = readJobFiles(id);
-            }
+                std::vector<std::string> lines = splitLines(v.output);
+                std::ostringstream out;
+                if (v.done) {
+                    out << "job " << id << ": DONE, exit " << v.exit;
+                }
+                else {
+                    out << "job " << id << ": RUNNING (still going after " << timeoutS << "s -- call job_wait again)";
+                }
+                out << ", " << lines.size() << " lines so far (log_id " << id << ")\n";
+                long long from = (long long)lines.size() - tailN;
+                if (from < 0) from = 0;
+                for (long long i = from; i < (long long)lines.size(); ++i) {
+                    out << lines[(size_t)i] << "\n";
+                }
+                return ToolResult::text(capOutput(out.str()));
+                });
+        }
+        // read_log -> fetch a window of a run/job log by its id (reads the log file)
+        {
+            Tool t("read_log", "Read a numbered window of a captured run/job log by its log_id.");
+            t.addParameter("log_id", PropertyType::Integer, "id returned by run or job");
+            t.addParameter("start", PropertyType::Integer, "1-based start line (default 1)", false);
+            t.addParameter("count", PropertyType::Integer, "How many lines (default 200)", false);
+            s.addTool(t, [](const rj::Value& a) {
+                long long id = args::integer(a, "log_id", 0);
+                JobView v = readJobFiles(id);
+                if (!v.exists) return ToolResult::error("read_log: unknown log_id");
 
-            std::vector<std::string> lines = splitLines(v.output);
-            std::ostringstream out;
-            if (v.done) {
-                out << "job " << id << ": DONE, exit " << v.exit;
-            }
-            else {
-                out << "job " << id << ": RUNNING (still going after " << timeoutS << "s -- call job_wait again)";
-            }
-            out << ", " << lines.size() << " lines so far (log_id " << id << ")\n";
-            long long from = (long long)lines.size() - tailN;
-            if (from < 0) from = 0;
-            for (long long i = from; i < (long long)lines.size(); ++i) {
-                out << lines[(size_t)i] << "\n";
-            }
-            return ToolResult::text(capOutput(out.str()));
-            });
-    }
-    // read_log -> fetch a window of a run/job log by its id (reads the log file)
-    {
-        Tool t("read_log", "Read a numbered window of a captured run/job log by its log_id.");
-        t.addParameter("log_id", PropertyType::Integer, "id returned by run or job");
-        t.addParameter("start", PropertyType::Integer, "1-based start line (default 1)", false);
-        t.addParameter("count", PropertyType::Integer, "How many lines (default 200)", false);
-        s.addTool(t, [](const rj::Value& a) {
-            long long id = args::integer(a, "log_id", 0);
-            JobView v = readJobFiles(id);
-            if (!v.exists) return ToolResult::error("read_log: unknown log_id");
+                long long start = args::integer(a, "start", 1);
+                long long count = args::integer(a, "count", 200);
+                if (start < 1) start = 1;
+                if (count < 1) count = 200;
 
-            long long start = args::integer(a, "start", 1);
-            long long count = args::integer(a, "count", 200);
-            if (start < 1) start = 1;
-            if (count < 1) count = 200;
-
-            std::vector<std::string> lines = splitLines(v.output);
-            std::ostringstream out;
-            out << "log " << id << " (" << lines.size() << " lines)  showing " << start << "..\n";
-            long long emitted = 0;
-            for (long long i = start; i <= (long long)lines.size() && emitted < count; ++i, ++emitted) {
-                out << i << ": " << tidy(lines[(size_t)i - 1], 1000) << "\n";
-            }
-            return ToolResult::text(capOutput(out.str()));
-            });
+                std::vector<std::string> lines = splitLines(v.output);
+                std::ostringstream out;
+                out << "log " << id << " (" << lines.size() << " lines)  showing " << start << "..\n";
+                long long emitted = 0;
+                for (long long i = start; i <= (long long)lines.size() && emitted < count; ++i, ++emitted) {
+                    out << i << ": " << tidy(lines[(size_t)i - 1], 1000) << "\n";
+                }
+                return ToolResult::text(capOutput(out.str()));
+                });
+        }
     }
 
     // set_workdir -> set the session base dir so all path args (and run) can be short
@@ -1248,11 +1548,39 @@ int main() {
                 if (!fs::is_directory(want, ec)) {
                     return ToolResult::error("set_workdir: not a directory: " + toU8(want));
                 }
-                setWorkdir(fs::weakly_canonical(want, ec).empty() ? want : fs::weakly_canonical(want, ec));
+                fs::path canon = fs::weakly_canonical(want, ec);
+                fs::path target = canon.empty() ? want : canon;
+                if (!withinRoot(target)) {
+                    return ToolResult::error("set_workdir: '" + toU8(target) + "' is outside the locked --root (" + toU8(g_rootLock) + "); staying at " + toU8(workdir()));
+                }
+                setWorkdir(target);
             }
             return ToolResult::text("workdir: " + toU8(workdir()));
             });
     }
 
+    // load_dir -> cache a directory tree in memory (background) for faster repeated access
+    {
+        Tool t("load_dir", "Load a directory's files into memory in the BACKGROUND so later search / read_lines / outline over that tree are served from RAM instead of disk. Returns a load-job id at once -- watch it with cache_status. Reads stay correct: a cached file is re-checked by mtime+size and refreshed if it changed on disk. Point it at the directory you're working in.");
+        t.addParameter("path", PropertyType::String, "Directory to load (relative to workdir or absolute; default '.')", false);
+        t.addParameter("memBudgetMB", PropertyType::Integer, "Stop after caching roughly this many MB (default 256)", false);
+        t.addParameter("maxFileSizeKB", PropertyType::Integer, "Skip any single file larger than this many KB (default 2048)", false);
+        t.addParameter("exts", PropertyType::String, "Only load these extensions, comma list e.g. 'cpp,h' (default: all text files)", false);
+        t.addParameter("setRoot", PropertyType::Boolean, "Also make this directory the session root (workdir), so later relative paths resolve here (default false)", false);
+        s.addTool(t, toolLoadDir);
+    }
+    // cache_clear -> free cached files
+    {
+        Tool t("cache_clear", "Free files loaded by load_dir. With no path, clears the whole cache; with a path, clears just the files under that directory.");
+        t.addParameter("path", PropertyType::String, "Directory to drop from the cache (default: clear everything)", false);
+        s.addTool(t, toolCacheClear);
+    }
+    // cache_status -> what's held in memory + load-job progress
+    {
+        Tool t("cache_status", "Show how many files (and how much memory) are cached, plus any load_dir jobs and their progress.");
+        s.addTool(t, toolCacheStatus);
+    }
+
     return s.run();   // hand off to the server loop (talks over stdio)
 }
+
