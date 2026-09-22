@@ -48,13 +48,13 @@ In a Claude config that looks like this:
   "mcpServers": {
     "fs": {
       "command": "C:\\Users\\wow\\Projects\\mcpp-fs\\x64\\Release\\mcpp-fs.exe",
-      "args": ["--root", "C:\\wow\\Projects\\my-very-secret-project"]
+      "args": ["--root", "C:\\Users\\wow\\Projects\\my-very-secret-project"]
     }
   }
 }
 ```
 
-With that, every session starts already sitting in `C:\wow\Projects\my-very-secret-project`.
+With that, every session starts already sitting in `C:\Users\wow\Projects\my-very-secret-project`.
 
 If the folder you pass isn't actually there, it won't fall over. It prints a quick
 note to stderr and keeps going with the default.
@@ -86,7 +86,7 @@ so the model has no way to shell out at all.
   "mcpServers": {
     "fs": {
       "command": "C:\\Users\\wow\\Projects\\mcpp-fs\\x64\\Release\\mcpp-fs.exe",
-      "args": ["--root", "C:\\wow\\Projects\\my-very-secret-project", "--no-exec"]
+      "args": ["--root", "C:\\Users\\wow\\Projects\\my-very-secret-project", "--no-exec"]
     }
   }
 }
