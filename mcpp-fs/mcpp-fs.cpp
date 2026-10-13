@@ -1,6 +1,7 @@
 #include "mcp_server.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -1179,6 +1180,20 @@ namespace {
             }
             catch (...) {
             }
+        }
+        for (;; ++next) {
+#if defined(_WIN32)
+            FILE* f = nullptr;
+            int rc = _wfopen_s(&f, jobLog(next).c_str(), L"wx");
+#else
+            FILE* f = std::fopen(jobLog(next).c_str(), "wx");
+            int rc = f ? 0 : errno;
+#endif
+            if (f) {
+                std::fclose(f);
+                break;
+            }
+            if (rc != EEXIST) break;
         }
         writeFile(jobCounter(), std::to_string(next + 1));
         return next;
