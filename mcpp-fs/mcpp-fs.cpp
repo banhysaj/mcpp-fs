@@ -1224,10 +1224,12 @@ namespace {
 #if defined(_WIN32)
         std::string script =
             "@echo off\r\n"
+            "if \"%~1\"==\":main\" goto main\r\n"
             "cd /d \"" + wd + "\"\r\n"
-            "call :main < nul > \"" + log + "\" 2>&1\r\n"
-            "> \"" + done + "\" echo %errorlevel%\r\n"
-            ">> \"" + log + "\" echo [job " + sid + " finished, exit %errorlevel%]\r\n"
+            "cmd /d /s /c \"\"%~f0\" :main\" < nul > \"" + log + "\" 2>&1\r\n"
+            "set rc=%errorlevel%\r\n"
+            ">> \"" + log + "\" echo [job " + sid + " finished, exit %rc%]\r\n"
+            "> \"" + done + "\" echo %rc%\r\n"
             "exit /b\r\n"
             ":main\r\n"
             + cmd + "\r\n";
@@ -1236,20 +1238,26 @@ namespace {
             return false;
         }
         std::string build = "start \"\" /b cmd /c \"" + toU8(jobBat(id)) + "\" >nul 2>nul";
-        std::system(build.c_str());
+        if (std::system(build.c_str()) != 0) {
+            err = "cannot start command";
+            return false;
+        }
 #else
         std::string script =
             "#!/bin/sh\n"
             "cd \"" + wd + "\"\n"
-            "{\n" + cmd + "\n} < /dev/null > \"" + log + "\" 2>&1\n"
+            "(\n" + cmd + "\n) < /dev/null > \"" + log + "\" 2>&1\n"
             "rc=$?\n"
-            "echo $rc > \"" + done + "\"\n"
-            "echo \"[job " + sid + " finished, exit $rc]\" >> \"" + log + "\"\n";
+            "echo \"[job " + sid + " finished, exit $rc]\" >> \"" + log + "\"\n"
+            "echo $rc > \"" + done + "\"\n";
         if (!writeFile(jobBat(id), script)) {
             err = "cannot write job script";
             return false;
         }
-        std::system(("sh \"" + toU8(jobBat(id)) + "\" >/dev/null 2>&1 &").c_str());
+        if (std::system(("sh \"" + toU8(jobBat(id)) + "\" >/dev/null 2>&1 &").c_str()) != 0) {
+            err = "cannot start command";
+            return false;
+        }
 #endif
         return true;
     }
@@ -1257,8 +1265,10 @@ namespace {
     void openViewer(const std::string& cmd, long long id) {
         std::string log = toU8(jobLog(id));
 #if defined(_WIN32)
-        std::string title = cmd;
+        std::string title = cmd.substr(0, 200);
         std::replace(title.begin(), title.end(), '"', '\'');
+        std::replace(title.begin(), title.end(), '\r', ' ');
+        std::replace(title.begin(), title.end(), '\n', ' ');
         std::string view =
             "start \"job " + std::to_string(id) + ": " + title + "\" powershell -NoProfile -Command "
             "\"Get-Content -LiteralPath '" + log + "' -Wait -Tail 5000\"";
