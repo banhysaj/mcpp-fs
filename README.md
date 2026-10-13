@@ -127,7 +127,7 @@ Changing things
 
 Running commands (present only when exec is on)
 
-- `run` runs a shell command, in the foreground or as a background job
+- `run` runs a shell command as a job, returning its result if it ends within `wait` seconds (default 5) and a job id otherwise
 - `job` checks on a background job
 - `job_wait` waits for a background job to finish
 - `read_log` reads the captured output of a run by its id

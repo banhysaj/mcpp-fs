@@ -22,14 +22,6 @@
 namespace fs = std::filesystem;
 using namespace mcpp_async;
 
-#if defined(_WIN32)
-#define MCP_POPEN  _popen
-#define MCP_PCLOSE _pclose
-#else
-#define MCP_POPEN  popen
-#define MCP_PCLOSE pclose
-#endif
-
 namespace {
 
     std::string toU8(const fs::path& p) {
@@ -1138,24 +1130,58 @@ namespace {
         return jobsDir() / ("job-" + std::to_string(id) + ".bat");
     }
 
+    constexpr auto kDoneJobTtl = std::chrono::minutes(15);
+    constexpr auto kOrphanJobTtl = std::chrono::hours(24);
+
+    fs::path jobCounter() {
+        return jobsDir() / "next-id";
+    }
+
     long long nextJobId() {
         std::lock_guard<std::mutex> lk(g_jobMx);
         long long mx = 0;
+        std::set<long long> expired;
         std::error_code ec;
+        auto now = fs::file_time_type::clock::now();
         for (fs::directory_iterator it(jobsDir(), ec), end; it != end && !ec; it.increment(ec)) {
             std::string fn = toU8(it->path().filename());
             if (fn.rfind("job-", 0) != 0) continue;
             size_t dot = fn.find('.', 4);
             if (dot == std::string::npos) continue;
+            long long v = 0;
             try {
-                long long v = std::stoll(fn.substr(4, dot - 4));
-                if (v > mx) mx = v;
+                v = std::stoll(fn.substr(4, dot - 4));
             }
             catch (...) {
-                // not a number we care, skip it
+                continue;
+            }
+            if (v > mx) mx = v;
+
+            std::string ext = fn.substr(dot);
+            std::error_code tec;
+            auto mtime = fs::last_write_time(it->path(), tec);
+            if (tec) continue;
+            if (ext == ".exit" && now - mtime > kDoneJobTtl) expired.insert(v);
+            if (ext == ".log" && now - mtime > kOrphanJobTtl && !fs::exists(jobExit(v), tec)) expired.insert(v);
+        }
+        for (long long v : expired) {
+            std::error_code rec;
+            fs::remove(jobBat(v), rec);
+            fs::remove(jobLog(v), rec);
+            fs::remove(jobExit(v), rec);
+        }
+
+        long long next = mx + 1;
+        std::string s;
+        if (readFile(jobCounter(), s)) {
+            try {
+                next = (std::max)(next, std::stoll(s));
+            }
+            catch (...) {
             }
         }
-        return mx + 1;
+        writeFile(jobCounter(), std::to_string(next + 1));
+        return next;
     }
 
     // A snapshot of a job, read straight from its files
@@ -1188,40 +1214,6 @@ namespace {
         return v;
     }
 
-    // Foreground run, block until the command finishes, get its output and exit code
-    // and write the same job files a background run would so read_log can pull it by id later
-    void runForeground(const std::string& cmd, long long id, std::string& output, int& code) {
-        std::string base = toU8(workdir());
-#if defined(_WIN32)
-        std::string full = "cd /d \"" + base + "\" && " + cmd + " 2>&1";
-#else
-        std::string full = "cd \"" + base + "\" && " + cmd + " 2>&1";
-#endif
-
-        output.clear();
-        FILE* p = MCP_POPEN(full.c_str(), "r");
-        if (!p) {
-            code = -1;
-            output = "(failed to start command)";
-        }
-        else {
-            char buf[4096];
-            size_t n;
-            while ((n = std::fread(buf, 1, sizeof(buf), p)) > 0) {
-                output.append(buf, n);
-            }
-            code = MCP_PCLOSE(p);
-        }
-
-        writeFile(jobLog(id), output);
-        writeFile(jobExit(id), std::to_string(code) + "\n");
-    }
-
-    // Background run, start two detached OS processes that outlive us
-    // 1. The command itself, write the .log so the client can read it
-    // 2. A visible console window that tails the .log at real time so the user can watch it
-    //    By default, it outlives the client or us, the server, so the user can see (better to have another window opened than debugging what happened)
-
     // We reroute through a tiny .bat to dodge cmd's nested-quote nightmare and to get a real %errorlevel% back out
     bool launchDetached(const std::string& cmd, long long id, std::string& err) {
         std::string wd = toU8(workdir());
@@ -1233,36 +1225,57 @@ namespace {
         std::string script =
             "@echo off\r\n"
             "cd /d \"" + wd + "\"\r\n"
-            + cmd + " > \"" + log + "\" 2>&1\r\n"
-            "echo %errorlevel%> \"" + done + "\"\r\n"
-            "echo [job " + sid + " finished, exit %errorlevel%]>> \"" + log + "\"\r\n";
+            "call :main < nul > \"" + log + "\" 2>&1\r\n"
+            "> \"" + done + "\" echo %errorlevel%\r\n"
+            ">> \"" + log + "\" echo [job " + sid + " finished, exit %errorlevel%]\r\n"
+            "exit /b\r\n"
+            ":main\r\n"
+            + cmd + "\r\n";
         if (!writeFile(jobBat(id), script)) {
             err = "cannot write job script";
             return false;
         }
-        // 1) the command: detached and headless, its stdio pointed at nul so it never touches the MCP pipe
         std::string build = "start \"\" /b cmd /c \"" + toU8(jobBat(id)) + "\" >nul 2>nul";
         std::system(build.c_str());
-        // 2) the viewer: a real window titled with the job, tailing the log live
-        std::string view =
-            "start \"job " + sid + ": " + cmd + "\" powershell -NoProfile -Command "
-            "\"Get-Content -LiteralPath '" + log + "' -Wait -Tail 5000\"";
-        std::system(view.c_str());
 #else
         std::string script =
             "#!/bin/sh\n"
             "cd \"" + wd + "\"\n"
-            + cmd + " > \"" + log + "\" 2>&1\n"
-            "echo $? > \"" + done + "\"\n"
-            "echo \"[job " + sid + " finished, exit $?]\" >> \"" + log + "\"\n";
+            "{\n" + cmd + "\n} < /dev/null > \"" + log + "\" 2>&1\n"
+            "rc=$?\n"
+            "echo $rc > \"" + done + "\"\n"
+            "echo \"[job " + sid + " finished, exit $rc]\" >> \"" + log + "\"\n";
         if (!writeFile(jobBat(id), script)) {
             err = "cannot write job script";
             return false;
         }
         std::system(("sh \"" + toU8(jobBat(id)) + "\" >/dev/null 2>&1 &").c_str());
-        std::system(("x-terminal-emulator -e sh -c 'tail -f \"" + log + "\"' >/dev/null 2>&1 &").c_str());
 #endif
         return true;
+    }
+
+    void openViewer(const std::string& cmd, long long id) {
+        std::string log = toU8(jobLog(id));
+#if defined(_WIN32)
+        std::string title = cmd;
+        std::replace(title.begin(), title.end(), '"', '\'');
+        std::string view =
+            "start \"job " + std::to_string(id) + ": " + title + "\" powershell -NoProfile -Command "
+            "\"Get-Content -LiteralPath '" + log + "' -Wait -Tail 5000\"";
+        std::system(view.c_str());
+#else
+        std::system(("x-terminal-emulator -e sh -c 'tail -f \"" + log + "\"' >/dev/null 2>&1 &").c_str());
+#endif
+    }
+
+    bool waitJob(long long id, long long seconds) {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+        for (;;) {
+            std::string s;
+            if (readFile(jobExit(id), s) && s.find_first_not_of(" \t\r\n") != std::string::npos) return true;
+            if (std::chrono::steady_clock::now() >= deadline) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
     }
 
 }
@@ -1402,37 +1415,41 @@ int main(int argc, char** argv) {
     if (allowExec) {
         // run -> execute a command
         {
-            Tool t("run", "Run a shell command (e.g. git) in the session workdir. Foreground returns exit code + last lines + a log_id. For anything slow, pass background:true -- it opens a visible window you can watch, returns a job_id at once, and keeps running even if this call is cancelled or the server restarts. Wait for it with 'job_wait'.");
+            Tool t("run", "Run a shell command (e.g. git) in the session workdir. Every run is a detached job: it waits up to 'wait' seconds and, if the command finished, returns exit code + last lines + a log_id. If it is still going, a visible window opens so it can be watched, and you get a job_id -- it keeps running even if this call is cancelled or the server restarts. Wait for it with 'job_wait'.");
             t.addParameter("command", PropertyType::String, "Command line to execute (runs in the workdir set by set_workdir)");
             t.addParameter("tail", PropertyType::Integer, "How many trailing lines to return (default 20)", false);
-            t.addParameter("background", PropertyType::Boolean, "Launch detached (visible window + on-disk log) and return a job_id at once. Use for long/slow commands. Default false.", false);
+            t.addParameter("wait", PropertyType::Integer, "Seconds to wait inline for the result before handing back a job_id (default 5, max 45 -- kept under the client timeout).", false);
+            t.addParameter("background", PropertyType::Boolean, "Don't wait at all: open the watch window and return a job_id at once (same as wait=0). Default false.", false);
             s.addTool(t, [](const rj::Value& a) {
                 std::string cmd = args::str(a, "command");
                 if (cmd.empty()) return ToolResult::error("run: 'command' is required");
                 long long tailN = args::integer(a, "tail", 20);
                 if (tailN < 0) tailN = 20;
-                bool background = args::boolean(a, "background", false);
+                long long waitS = args::integer(a, "wait", 5);
+                if (waitS < 0) waitS = 0;
+                if (waitS > 45) waitS = 45;
+                if (args::boolean(a, "background", false)) waitS = 0;
 
                 long long id = nextJobId();
+                std::string err;
+                if (!launchDetached(cmd, id, err)) return ToolResult::error("run: " + err);
 
-                if (background) {
-                    std::string err;
-                    if (!launchDetached(cmd, id, err)) return ToolResult::error("run: " + err);
+                if (waitS == 0 || !waitJob(id, waitS)) {
+                    openViewer(cmd, id);
                     std::ostringstream out;
-                    out << "started background job " << id << " (job_id " << id << ", log_id " << id << ")\n"
-                        << "A window opened so you can watch it live.\n"
+                    out << "running as background job " << id << " (job_id " << id << ", log_id " << id << ")";
+                    if (waitS > 0) out << ", still going after " << waitS << "s";
+                    out << "\nA window opened so you can watch it live.\n"
                         << "Wait for it:  job_wait id=" << id << "   Status:  job id=" << id
                         << "   Full log:  read_log log_id=" << id << "\n"
                         << "Survives a server/Claude restart (state is on disk).";
                     return ToolResult::text(capOutput(out.str()));
                 }
 
-                std::string output;
-                int code;
-                runForeground(cmd, id, output, code);
-                std::vector<std::string> lines = splitLines(output);
+                JobView v = readJobFiles(id);
+                std::vector<std::string> lines = splitLines(v.output);
                 std::ostringstream out;
-                out << "exit " << code << ", " << lines.size() << " lines (log_id " << id << ")\n";
+                out << "exit " << v.exit << ", " << lines.size() << " lines (log_id " << id << ")\n";
                 long long from = (long long)lines.size() - tailN;
                 if (from < 0) from = 0;
                 for (long long i = from; i < (long long)lines.size(); ++i) {
@@ -1444,7 +1461,7 @@ int main(int argc, char** argv) {
         // job -> non-blocking status snapshot of a background job
         {
             Tool t("job", "Check a background 'run' job: RUNNING or DONE + exit code, plus the last lines of its output. Non-blocking snapshot, to wait, use job_wait.");
-            t.addParameter("id", PropertyType::Integer, "job_id returned by run(background:true)");
+            t.addParameter("id", PropertyType::Integer, "job_id returned by run");
             t.addParameter("tail", PropertyType::Integer, "How many trailing lines to return (default 20)", false);
             s.addTool(t, [](const rj::Value& a) {
                 long long id = args::integer(a, "id", 0);
@@ -1467,29 +1484,24 @@ int main(int argc, char** argv) {
                 });
         }
         // job_wait -> long-poll a job's files until it finishes (or times out)
-        // The default timeout is between 45-50 seconds, that's how long usually client wait before restarting an stdio mcp server 
         {
             Tool t("job_wait", "Wait for a background 'run' job to finish, then return its exit code + tail. Polls the job's on-disk state and returns THE MOMENT it completes (or, if still running after 'timeout' seconds, a RUNNING status -- just call again). Use this instead of sleeping.");
-            t.addParameter("id", PropertyType::Integer, "job_id returned by run(background:true)");
-            t.addParameter("timeout", PropertyType::Integer, "Max seconds to block (default 45, max 50 -- kept under the client timeout so it never forces a server restart).", false);
+            t.addParameter("id", PropertyType::Integer, "job_id returned by run");
+            t.addParameter("timeout", PropertyType::Integer, "Max seconds to block (default 5, max 50 -- kept under the client timeout so it never forces a server restart).", false);
             t.addParameter("tail", PropertyType::Integer, "How many trailing lines to return (default 20)", false);
             s.addTool(t, [](const rj::Value& a) {
                 long long id = args::integer(a, "id", 0);
-                long long timeoutS = args::integer(a, "timeout", 45);
+                long long timeoutS = args::integer(a, "timeout", 5);
                 long long tailN = args::integer(a, "tail", 20);
                 if (timeoutS < 1) timeoutS = 1;
                 if (timeoutS > 50) timeoutS = 50;
                 if (tailN < 0) tailN = 20;
 
-                JobView v = readJobFiles(id);
-                if (!v.exists) {
+                if (!readJobFiles(id).exists) {
                     return ToolResult::error("job_wait: unknown id " + std::to_string(id));
                 }
-                auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeoutS);
-                while (!v.done && std::chrono::steady_clock::now() < deadline) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                    v = readJobFiles(id);
-                }
+                waitJob(id, timeoutS);
+                JobView v = readJobFiles(id);
 
                 std::vector<std::string> lines = splitLines(v.output);
                 std::ostringstream out;
