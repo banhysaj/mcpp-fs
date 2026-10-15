@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <random>
+#include <stdexcept>
 #include <atomic>
 #include <regex>
 #include <set>
@@ -44,7 +46,7 @@ namespace {
     }
 
     std::mutex g_wdMx;
-    fs::path g_workdir = fs::current_path();
+    fs::path g_workdir;
 
     // lock the entire session to the root, if we are given a root parameter
     fs::path g_rootLock;
@@ -52,46 +54,15 @@ namespace {
 
     fs::path workdir() {
         std::lock_guard<std::mutex> lk(g_wdMx);
+        if (g_workdir.empty()) {
+            throw std::runtime_error("workdir not set (new session or the server restarted): call set_workdir with the project root, or pass an absolute path");
+        }
         return g_workdir;
     }
 
-    // We stash the workdir in a temp file so a forced restart (The client could relaunch us at any given moment) doesn't drop us back to the process cwd
-    // Written whenever it changes, read back on startup
-    fs::path workdirFile() {
-        std::error_code ec;
-        return fs::temp_directory_path(ec) / "fs-mcp-workdir.txt";
-    }
-
     void setWorkdir(const fs::path& p) {
-        {
-            std::lock_guard<std::mutex> lk(g_wdMx);
-            g_workdir = p;
-        }
-        std::ofstream f(workdirFile(), std::ios::binary);
-        if (f) {
-            f << toU8(p);
-        }
-    }
-
-    void loadPersistedWorkdir() {
-        std::ifstream f(workdirFile(), std::ios::binary);
-        if (!f) return;
-
-        std::ostringstream ss;
-        ss << f.rdbuf();
-        std::string p = ss.str();
-
-        // trim any trailing whitespace/newlines the file picked up
-        while (!p.empty() && (p.back() == '\n' || p.back() == '\r' || p.back() == ' ' || p.back() == '\t')) {
-            p.pop_back();
-        }
-
-        std::error_code ec;
-        fs::path fp = fromU8(p);
-        if (!p.empty() && fs::is_directory(fp, ec)) {
-            std::lock_guard<std::mutex> lk(g_wdMx);
-            g_workdir = fp;
-        }
+        std::lock_guard<std::mutex> lk(g_wdMx);
+        g_workdir = p;
     }
 
     // Turn a path arg from the model into a real path. Absolute paths are used as-is;
@@ -1134,13 +1105,9 @@ namespace {
     constexpr auto kDoneJobTtl = std::chrono::minutes(15);
     constexpr auto kOrphanJobTtl = std::chrono::hours(24);
 
-    fs::path jobCounter() {
-        return jobsDir() / "next-id";
-    }
-
     long long nextJobId() {
         std::lock_guard<std::mutex> lk(g_jobMx);
-        long long mx = 0;
+        static std::mt19937_64 rng(std::random_device{}());
         std::set<long long> expired;
         std::error_code ec;
         auto now = fs::file_time_type::clock::now();
@@ -1156,7 +1123,6 @@ namespace {
             catch (...) {
                 continue;
             }
-            if (v > mx) mx = v;
 
             std::string ext = fn.substr(dot);
             std::error_code tec;
@@ -1172,16 +1138,10 @@ namespace {
             fs::remove(jobExit(v), rec);
         }
 
-        long long next = mx + 1;
-        std::string s;
-        if (readFile(jobCounter(), s)) {
-            try {
-                next = (std::max)(next, std::stoll(s));
-            }
-            catch (...) {
-            }
-        }
-        for (;; ++next) {
+        std::uniform_int_distribution<long long> pick(100000, 999999999);
+        long long next = 0;
+        for (;;) {
+            next = pick(rng);
 #if defined(_WIN32)
             FILE* f = nullptr;
             int rc = _wfopen_s(&f, jobLog(next).c_str(), L"wx");
@@ -1195,7 +1155,6 @@ namespace {
             }
             if (rc != EEXIST) break;
         }
-        writeFile(jobCounter(), std::to_string(next + 1));
         return next;
     }
 
@@ -1230,8 +1189,7 @@ namespace {
     }
 
     // We reroute through a tiny .bat to dodge cmd's nested-quote nightmare and to get a real %errorlevel% back out
-    bool launchDetached(const std::string& cmd, long long id, std::string& err) {
-        std::string wd = toU8(workdir());
+    bool launchDetached(const std::string& cmd, const std::string& wd, long long id, std::string& err) {
         std::string log = toU8(jobLog(id));
         std::string done = toU8(jobExit(id));
         std::string sid = std::to_string(id);
@@ -1307,7 +1265,6 @@ namespace {
 
 int main(int argc, char** argv) {
     Server s("fs-mcp-server", "1.0.0");
-    loadPersistedWorkdir(); // if workdir exists, pick it up
     bool allowExec = true;
 
 
@@ -1455,9 +1412,10 @@ int main(int argc, char** argv) {
                 if (waitS > 45) waitS = 45;
                 if (args::boolean(a, "background", false)) waitS = 0;
 
+                std::string wd = toU8(workdir());
                 long long id = nextJobId();
                 std::string err;
-                if (!launchDetached(cmd, id, err)) return ToolResult::error("run: " + err);
+                if (!launchDetached(cmd, wd, id, err)) return ToolResult::error("run: " + err);
 
                 if (waitS == 0 || !waitJob(id, waitS)) {
                     openViewer(cmd, id);
